@@ -11,6 +11,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.regularizers import l2
 from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras.callbacks import EarlyStopping
 from skimage.morphology import skeletonize
 
@@ -61,7 +62,7 @@ DEFAULT_THRESHOLD = 0.5  # Baseline decision threshold; compared against Youden'
 
 oct_images, octa_images, clinical_data, labels = [], [], [], []
 
-print("⏳ 1/5: Extracting features, applying CLAHE + Blur, and loading dataset...")
+print("⏳ 1/4: Extracting features, applying CLAHE + Blur, and loading dataset...")
 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 for category in ['healthy', 'dr']:
@@ -114,15 +115,23 @@ print(f"✅ Balanced dataset ready! Total images processed: {len(Y)}")
 # as a validation set during training. With 182 samples this yields ~27 test,
 # ~31 validation, and ~124 training samples — a deliberate trade-off to maximise
 # training data on a small medical dataset.
-print("⏳ 2/5: Splitting data into train/test sets...")
+print("⏳ 2/4: Splitting data into train/test sets...")
 X_oct_train, X_oct_test, X_octa_train, X_octa_test, X_clinic_train, X_clinic_test, Y_train, Y_test = train_test_split(
     X_oct, X_octa, X_clinic, Y, test_size=0.15, random_state=42, stratify=Y
 )
 
+# Class weights: computed from the training labels so the model penalises
+# misclassifying the minority class more heavily, improving DR recall.
+class_weights_array = compute_class_weight(
+    class_weight='balanced', classes=np.unique(Y_train), y=Y_train
+)
+class_weights = dict(enumerate(class_weights_array))
+print(f"  Class weights: {class_weights}")
+
 # ==========================================
-# 4. BUILD HYBRID ARCHITECTURE (PHASE 1)
+# 4. BUILD HYBRID ARCHITECTURE (FROZEN BACKBONE)
 # ==========================================
-print("⏳ 3/5: Building Hybrid Neural Network (Phase 1 — Frozen Backbone)...")
+print("⏳ 3/4: Building Hybrid Neural Network (Frozen Backbone)...")
 oct_input = Input(shape=(224, 224, 3), name="oct_image")
 octa_input = Input(shape=(224, 224, 3), name="octa_image")
 clinical_input = Input(shape=(5,), name="clinical_metrics")
@@ -131,7 +140,7 @@ clinical_input = Input(shape=(5,), name="clinical_metrics")
 # Weight sharing reduces the number of trainable parameters, which is beneficial
 # given the small dataset, and allows the network to learn modality-agnostic features.
 vision_backbone = EfficientNetB0(weights='imagenet', include_top=False)
-vision_backbone.trainable = False  # Freeze entire backbone for Phase 1
+vision_backbone.trainable = False  # Backbone stays fully frozen for the entire training process
 
 x_oct = GlobalAveragePooling2D()(vision_backbone(oct_input, training=False))
 x_octa = GlobalAveragePooling2D()(vision_backbone(octa_input, training=False))
@@ -140,11 +149,11 @@ y_clinic = Dense(32, activation='relu')(clinical_input)
 y_clinic = Dense(16, activation='relu')(y_clinic)
 
 combined = Concatenate()([x_oct, x_octa, y_clinic])
-z = Dense(128, activation='relu', kernel_regularizer=l2(1e-4))(combined)
+z = Dense(128, activation='relu', kernel_regularizer=l2(0.01))(combined)
 # Dropout 0.6: aggressive regularization is intentional given the very small dataset
-# (182 samples). Combined with L2, it strongly discourages overfitting.
+# (182 samples). Combined with L2 (0.01), it strongly discourages overfitting.
 z = Dropout(0.6)(z)
-z = Dense(64, activation='relu', kernel_regularizer=l2(1e-4))(z)
+z = Dense(64, activation='relu', kernel_regularizer=l2(0.01))(z)
 output = Dense(1, activation='sigmoid', name="final_diagnosis")(z)
 
 hybrid_model = Model(inputs=[oct_input, octa_input, clinical_input], outputs=output)
@@ -155,98 +164,40 @@ hybrid_model.compile(
 )
 
 # ==========================================
-# 5. PHASE 1 TRAINING (FROZEN BACKBONE)
+# 5. TRAINING (FROZEN BACKBONE)
 # ==========================================
-print("🚀 4/5: Training Phase 1 (Frozen Backbone)...")
+print("🚀 4/4: Training Model (Frozen Backbone)...")
 
-early_stop_phase1 = EarlyStopping(
-    monitor='val_loss',
-    patience=4,
-    restore_best_weights=True
-)
-
-history_phase1 = hybrid_model.fit(
-    x=[X_oct_train, X_octa_train, X_clinic_train],
-    y=Y_train,
-    epochs=30,
-    batch_size=8,
-    validation_split=0.2,
-    callbacks=[early_stop_phase1],
-    verbose=1
-)
-
-# Plot Phase 1 training curves
-fig, ax = plt.subplots(1, 2, figsize=(14, 5))
-ax[0].plot(history_phase1.history['accuracy'], label='Training Accuracy', color='blue')
-ax[0].plot(history_phase1.history['val_accuracy'], label='Validation Accuracy', color='orange')
-ax[0].set_title('Phase 1 — Model Accuracy')
-ax[0].set_xlabel('Epochs')
-ax[0].set_ylabel('Accuracy')
-ax[0].legend()
-ax[0].grid(True, linestyle='--')
-
-ax[1].plot(history_phase1.history['loss'], label='Training Loss', color='blue')
-ax[1].plot(history_phase1.history['val_loss'], label='Validation Loss', color='orange')
-ax[1].set_title('Phase 1 — Model Loss')
-ax[1].set_xlabel('Epochs')
-ax[1].set_ylabel('Loss')
-ax[1].legend()
-ax[1].grid(True, linestyle='--')
-plt.tight_layout()
-plt.show()
-
-# ==========================================
-# 6. PHASE 2 FINE-TUNING (UNFREEZE TOP 20 LAYERS)
-# ==========================================
-print("\n🔓 Starting Phase 2: Fine-Tuning Top 20 Backbone Layers...")
-
-# Unfreeze the entire backbone first, then re-freeze all but the top 20 layers.
-# Top 20 layers contain the highest-level, most task-specific features; unfreezing
-# only these layers allows gentle domain adaptation while preserving the stable
-# low-level features learned on ImageNet, preventing catastrophic forgetting.
-vision_backbone.trainable = True
-for layer in vision_backbone.layers[:-20]:
-    layer.trainable = False
-
-# Recompile with a microscopic learning rate to avoid destroying learned features
-hybrid_model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
-    loss='binary_crossentropy',
-    metrics=['accuracy']
-)
-
-trainable_count = sum(1 for layer in vision_backbone.layers if layer.trainable)
-print(f"  Backbone layers unfrozen for fine-tuning: {trainable_count} / {len(vision_backbone.layers)}")
-
-early_stop_phase2 = EarlyStopping(
+early_stop = EarlyStopping(
     monitor='val_loss',
     patience=5,
     restore_best_weights=True
 )
 
-history_phase2 = hybrid_model.fit(
+history = hybrid_model.fit(
     x=[X_oct_train, X_octa_train, X_clinic_train],
     y=Y_train,
-    epochs=20,
+    epochs=30,
     batch_size=8,
     validation_split=0.2,
-    callbacks=[early_stop_phase2],
+    callbacks=[early_stop],
+    class_weight=class_weights,
     verbose=1
 )
 
-# Plot Phase 2 training curves
+# Plot training curves
 fig, ax = plt.subplots(1, 2, figsize=(14, 5))
-ax[0].plot(history_phase2.history['accuracy'], label='Training Accuracy', color='green')
-ax[0].plot(history_phase2.history['val_accuracy'], label='Validation Accuracy', color='red')
-ax[0].set_title('Phase 2 Fine-Tuning — Model Accuracy')
+ax[0].plot(history.history['accuracy'], label='Training Accuracy', color='blue')
+ax[0].plot(history.history['val_accuracy'], label='Validation Accuracy', color='orange')
+ax[0].set_title('Model Accuracy')
 ax[0].set_xlabel('Epochs')
 ax[0].set_ylabel('Accuracy')
 ax[0].legend()
 ax[0].grid(True, linestyle='--')
 
-ax[1].plot(history_phase2.history['loss'], label='Training Loss', color='green')
-ax[1].plot(history_phase2.history['val_loss'], label='Validation Loss', color='red')
-ax[1].set_title('Phase 2 Fine-Tuning — Model Loss')
+ax[1].plot(history.history['loss'], label='Training Loss', color='blue')
+ax[1].plot(history.history['val_loss'], label='Validation Loss', color='orange')
+ax[1].set_title('Model Loss')
 ax[1].set_xlabel('Epochs')
 ax[1].set_ylabel('Loss')
 ax[1].legend()
@@ -255,9 +206,9 @@ plt.tight_layout()
 plt.show()
 
 # ==========================================
-# 7. EVALUATE ON THE BLIND TEST SET
+# 6. EVALUATE ON THE BLIND TEST SET
 # ==========================================
-print("\n📊 5/5: Generating Evaluation Metrics on Test Set...")
+print("\n📊 Generating Evaluation Metrics on Test Set...")
 
 predictions = hybrid_model.predict([X_oct_test, X_octa_test, X_clinic_test])
 predictions_binary = (predictions > DEFAULT_THRESHOLD).astype(int)
@@ -289,7 +240,7 @@ plt.grid(True, linestyle='--', alpha=0.6)
 plt.show()
 
 # ==========================================
-# 8. APPLY OPTIMAL THRESHOLD (YOUDEN'S INDEX)
+# 7. APPLY OPTIMAL THRESHOLD (YOUDEN'S INDEX)
 # ==========================================
 print("\n🔍 Calculating Optimal Diagnostic Threshold...")
 
