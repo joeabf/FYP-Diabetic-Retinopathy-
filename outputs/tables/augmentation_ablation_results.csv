@@ -1,0 +1,4 @@
+augmentation_mode,recall,specificity,f1,balanced_accuracy,roc_auc,pr_auc,threshold
+none,0.8,0.934,0.842,0.867,0.934,0.891,0.5
+basic_all,0.943,0.934,0.892,0.938,0.979,0.939,0.46
+basic_dr_only,0.914,0.956,0.901,0.935,0.972,0.928,0.48
