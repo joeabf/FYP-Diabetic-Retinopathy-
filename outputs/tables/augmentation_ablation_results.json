@@ -1,0 +1,32 @@
+[
+  {
+    "augmentation_mode": "none",
+    "recall": 0.8,
+    "specificity": 0.934,
+    "f1": 0.842,
+    "balanced_accuracy": 0.867,
+    "roc_auc": 0.934,
+    "pr_auc": 0.891,
+    "threshold": 0.5
+  },
+  {
+    "augmentation_mode": "basic_all",
+    "recall": 0.943,
+    "specificity": 0.934,
+    "f1": 0.892,
+    "balanced_accuracy": 0.938,
+    "roc_auc": 0.979,
+    "pr_auc": 0.939,
+    "threshold": 0.46
+  },
+  {
+    "augmentation_mode": "basic_dr_only",
+    "recall": 0.914,
+    "specificity": 0.956,
+    "f1": 0.901,
+    "balanced_accuracy": 0.935,
+    "roc_auc": 0.972,
+    "pr_auc": 0.928,
+    "threshold": 0.48
+  }
+]
