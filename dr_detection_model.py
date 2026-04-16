@@ -111,14 +111,23 @@ print(f"✅ Balanced dataset ready! Total images processed: {len(Y)}")
 # ==========================================
 # 3. SPLIT DATA
 # ==========================================
-# Split strategy: 15% blind test set, then 20% of the remaining training data is used
-# as a validation set during training. With 182 samples this yields ~27 test,
-# ~31 validation, and ~124 training samples — a deliberate trade-off to maximise
-# training data on a small medical dataset.
-print("⏳ 2/4: Splitting data into train/test sets...")
-X_oct_train, X_oct_test, X_octa_train, X_octa_test, X_clinic_train, X_clinic_test, Y_train, Y_test = train_test_split(
+# Split strategy: 15% blind test set first, then 20% of the remainder is carved
+# out as an explicit validation set used for (a) early-stopping during training
+# and (b) calibrating Youden's optimal threshold.  The threshold is therefore
+# derived from data the model saw only as validation — never as training input —
+# and the final test set remains completely untouched until evaluation.
+# With ~126 samples this yields roughly 19 test, 21 val, and 86 train samples.
+print("⏳ 2/4: Splitting data into train/val/test sets...")
+X_oct_trainval, X_oct_test, X_octa_trainval, X_octa_test, X_clinic_trainval, X_clinic_test, Y_trainval, Y_test = train_test_split(
     X_oct, X_octa, X_clinic, Y, test_size=0.15, random_state=42, stratify=Y
 )
+
+X_oct_train, X_oct_val, X_octa_train, X_octa_val, X_clinic_train, X_clinic_val, Y_train, Y_val = train_test_split(
+    X_oct_trainval, X_octa_trainval, X_clinic_trainval, Y_trainval,
+    test_size=0.2, random_state=42, stratify=Y_trainval
+)
+
+print(f"  Train: {len(Y_train)} | Val: {len(Y_val)} | Test: {len(Y_test)}")
 
 # Class weights: computed from the training labels so the model penalises
 # misclassifying the minority class more heavily, improving DR recall.
@@ -179,7 +188,7 @@ history = hybrid_model.fit(
     y=Y_train,
     epochs=30,
     batch_size=8,
-    validation_split=0.2,
+    validation_data=([X_oct_val, X_octa_val, X_clinic_val], Y_val),
     callbacks=[early_stop],
     class_weight=class_weights,
     verbose=1
@@ -242,15 +251,20 @@ plt.show()
 # ==========================================
 # 7. APPLY OPTIMAL THRESHOLD (YOUDEN'S INDEX)
 # ==========================================
-print("\n🔍 Calculating Optimal Diagnostic Threshold...")
+# The optimal decision threshold is calibrated on the **validation** set so
+# that the blind test-set evaluation remains unbiased.
+print("\n🔍 Calculating Optimal Diagnostic Threshold on Validation Set...")
 
-youden_index = tpr - fpr
-optimal_idx = np.argmax(youden_index)
-optimal_threshold = thresholds[optimal_idx]
+val_predictions = hybrid_model.predict([X_oct_val, X_octa_val, X_clinic_val])
+fpr_val, tpr_val, thresholds_val = roc_curve(Y_val, val_predictions)
+youden_index_val = tpr_val - fpr_val
+optimal_idx = np.argmax(youden_index_val)
+optimal_threshold = thresholds_val[optimal_idx]
 
 print(f"🎯 Default AI Threshold: 0.500 (50%)")
-print(f"🎯 Optimal Data Threshold: {optimal_threshold:.3f} ({optimal_threshold * 100:.1f}%)")
+print(f"🎯 Optimal Threshold (from validation set): {optimal_threshold:.3f} ({optimal_threshold * 100:.1f}%)")
 
+# Apply the validation-derived threshold to the *blind* test set
 predictions_optimal = (predictions >= optimal_threshold).astype(int)
 
 cm_optimal = confusion_matrix(Y_test, predictions_optimal)
@@ -259,8 +273,8 @@ plt.figure(figsize=(6, 5))
 sns.heatmap(cm_optimal, annot=True, fmt='d', cmap='Greens',
             xticklabels=['Predicted Healthy', 'Predicted DR'],
             yticklabels=['Actual Healthy', 'Actual DR'])
-plt.title(f'Diagnostic Confusion Matrix (Optimal Threshold = {optimal_threshold:.2f})')
+plt.title(f'Diagnostic Confusion Matrix — Optimal Threshold ({optimal_threshold:.2f}, val-calibrated) (Test Set)')
 plt.show()
 
-print("\n📑 Classification Report (Optimal Threshold):")
+print(f"\n📑 Classification Report (Optimal Threshold {optimal_threshold:.2f}, val-calibrated, Test Set):")
 print(classification_report(Y_test, predictions_optimal, target_names=['Healthy', 'DR']))
